@@ -84,6 +84,175 @@ pub struct PathAttr<'p> {
     context_path: Option<String>,
 }
 
+#[derive(Default)]
+#[cfg_attr(feature = "debug", derive(Debug))]
+pub struct FbrPathAttr<'p> {
+    request_body: Option<RequestBodyAttr<'p>>,
+    responses: Vec<Response<'p>>,
+    operation_id: Option<String>,
+    tag: Option<String>,
+    params: Vec<Parameter<'p>>,
+    security: Option<Array<'p, SecurityRequirementAttr>>,
+    context_path: Option<String>,
+}
+
+pub fn fbr_to_path_attr<'a>(fbr_path_attribute: FbrPathAttr<'a>, path: &'a str, path_operation: PathOperation) -> PathAttr<'a> {
+    PathAttr {
+        path_operation: Some(path_operation),
+        request_body: fbr_path_attribute.request_body,
+        responses: fbr_path_attribute.responses,
+        path: Some(path.into()),
+        operation_id: fbr_path_attribute.operation_id,
+        tag: fbr_path_attribute.tag,
+        params: fbr_path_attribute.params,
+        security: fbr_path_attribute.security,
+        context_path: fbr_path_attribute.context_path,
+    }
+}
+
+//--------
+impl<'p> FbrPathAttr<'p> {
+    #[cfg(any(
+        feature = "actix_extras",
+        feature = "rocket_extras",
+        feature = "axum_extras"
+    ))]
+    pub fn update_parameters<'a>(&mut self, arguments: Option<Vec<ValueArgument<'a>>>)
+    where
+        'a: 'p,
+    {
+        if let Some(arguments) = arguments {
+            if !self.params.is_empty() {
+                let mut value_parameters: Vec<&mut ValueParameter> = self
+                    .params
+                    .iter_mut()
+                    .filter_map(|parameter| match parameter {
+                        Parameter::Value(value) => Some(value),
+                        Parameter::Struct(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                let (existing_arguments, new_arguments): (Vec<ValueArgument>, Vec<ValueArgument>) =
+                    arguments.into_iter().partition(|argument| {
+                        value_parameters.iter().any(|parameter| {
+                            Some(parameter.name.as_ref()) == argument.name.as_deref()
+                        })
+                    });
+
+                for argument in existing_arguments {
+                    if let Some(parameter) = value_parameters
+                        .iter_mut()
+                        .find(|parameter| Some(parameter.name.as_ref()) == argument.name.as_deref())
+                    {
+                        parameter.update_parameter_type(argument.type_tree);
+                    }
+                }
+                self.params
+                    .extend(new_arguments.into_iter().map(Parameter::from));
+            } else {
+                // no parameters at all, add arguments to the parameters
+                let mut parameters = Vec::with_capacity(arguments.len());
+
+                arguments
+                    .into_iter()
+                    .map(Parameter::from)
+                    .for_each(|parameter| parameters.push(parameter));
+                self.params = parameters;
+            }
+        }
+    }
+
+    #[cfg(any(
+        feature = "actix_extras",
+        feature = "rocket_extras",
+        feature = "axum_extras"
+    ))]
+    pub fn update_parameters_parameter_in(
+        &mut self,
+        into_params_types: Option<Vec<IntoParamsType>>,
+    ) {
+        if !self.params.is_empty() {
+            if let Some(mut into_params_types) = into_params_types {
+                self.params
+                    .iter_mut()
+                    .filter_map(|parameter| match parameter {
+                        Parameter::Value(_) => None,
+                        Parameter::Struct(parameter) => Some(parameter),
+                    })
+                    .for_each(|parameter| {
+                        if let Some(into_params_argument) =
+                            into_params_types
+                                .iter_mut()
+                                .find(|argument| matches!(&argument.type_path, Some(path) if path.as_ref() == &parameter.path.path))
+                        {
+                            parameter.update_parameter_in(
+                                &mut into_params_argument.parameter_in_provider,
+                            );
+                        }
+                    })
+            }
+        }
+    }
+}
+
+impl Parse for FbrPathAttr<'_> {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        const EXPECTED_ATTRIBUTE_MESSAGE: &str = "unexpected identifier, expected any of: operation_id, path, get, post, put, delete, options, head, patch, trace, connect, request_body, responses, params, tag, security, context_path";
+        let mut path_attr = FbrPathAttr::default();
+
+        while !input.is_empty() {
+            let ident = input.parse::<Ident>().map_err(|error| {
+                syn::Error::new(
+                    error.span(),
+                    format!("{}, {}", EXPECTED_ATTRIBUTE_MESSAGE, error),
+                )
+            })?;
+            let attribute_name = &*ident.to_string();
+
+            match attribute_name {
+                "operation_id" => {
+                    path_attr.operation_id = Some(parse_utils::parse_next_literal_str(input)?);
+                }
+                "request_body" => {
+                    path_attr.request_body = Some(input.parse::<RequestBodyAttr>()?);
+                }
+                "responses" => {
+                    let responses;
+                    parenthesized!(responses in input);
+                    path_attr.responses =
+                        Punctuated::<Response, Token![,]>::parse_terminated(&responses)
+                            .map(|punctuated| punctuated.into_iter().collect::<Vec<Response>>())?;
+                }
+                "params" => {
+                    let params;
+                    parenthesized!(params in input);
+                    path_attr.params =
+                        Punctuated::<Parameter, Token![,]>::parse_terminated(&params)
+                            .map(|punctuated| punctuated.into_iter().collect::<Vec<Parameter>>())?;
+                }
+                "tag" => {
+                    path_attr.tag = Some(parse_utils::parse_next_literal_str(input)?);
+                }
+                "security" => {
+                    let security;
+                    parenthesized!(security in input);
+                    path_attr.security = Some(parse_utils::parse_groups(&security)?)
+                }
+                "context_path" => {
+                    path_attr.context_path = Some(parse_utils::parse_next_literal_str(input)?)
+                }
+                _ => {}
+            }
+
+            if !input.is_empty() {
+                input.parse::<Token![,]>()?;
+            }
+        }
+
+        Ok(path_attr)
+    }
+}
+//------#
+
 impl<'p> PathAttr<'p> {
     #[cfg(any(
         feature = "actix_extras",

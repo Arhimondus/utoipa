@@ -4,6 +4,7 @@
 //! of the library documentation is available through **utoipa** library itself.
 //! Consider browsing via the **utoipa** crate so all links will work correctly.
 
+#![feature(proc_macro_span)]
 #![warn(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
 
@@ -14,7 +15,8 @@ use doc_comment::CommentAttributes;
 
 use component::into_params::IntoParams;
 use ext::{PathOperationResolver, PathOperations, PathResolver};
-use openapi::OpenApi;
+use openapi::{OpenApi, OpenApiAttr};
+use path::{FbrPathAttr, PathOperation};
 use proc_macro::TokenStream;
 use proc_macro_error::{proc_macro_error, OptionExt, ResultExt};
 use quote::{quote, ToTokens, TokenStreamExt};
@@ -1248,203 +1250,294 @@ pub fn path(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 #[proc_macro_error]
+#[proc_macro_attribute]
+pub fn fbr_path(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let fbr_path_attribute = syn::parse_macro_input!(attr as FbrPathAttr);
+   
+    let ast_fn = syn::parse::<ItemFn>(item).unwrap_or_abort();
+    let fn_name = &*ast_fn.sig.ident.to_string();
+    let path_operation = if fn_name == "get" {
+        PathOperation::Get
+    } else {
+        PathOperation::Post
+    };
+
+    let span = proc_macro::Span::call_site();
+    let source = span.source_file();
+	let source_path_buf = source.path();
+    let actix_path = actix_fbr_resolver::actix_path(source_path_buf);
+    let path_attribute = path::fbr_to_path_attr(fbr_path_attribute, &actix_path, path_operation);
+
+    #[cfg(any(
+        feature = "actix_extras",
+        feature = "rocket_extras",
+        feature = "axum_extras"
+    ))]
+    let mut path_attribute = path_attribute;
+
+    let mut resolved_operation = PathOperations::resolve_operation(&ast_fn);
+
+    let resolved_path = PathOperations::resolve_path(
+        &resolved_operation
+            .as_mut()
+            .map(|operation| mem::take(&mut operation.path))
+            .or_else(|| path_attribute.path.as_ref().map(String::to_string)), // cannot use mem take because we need this later
+    );
+
+    #[cfg(any(
+        feature = "actix_extras",
+        feature = "rocket_extras",
+        feature = "axum_extras"
+    ))]
+    let mut resolved_path = resolved_path;
+
+    #[cfg(any(
+        feature = "actix_extras",
+        feature = "rocket_extras",
+        feature = "axum_extras"
+    ))]
+    {
+        use ext::ArgumentResolver;
+        let args = resolved_path.as_mut().map(|path| mem::take(&mut path.args));
+        let (arguments, into_params_types) =
+            PathOperations::resolve_arguments(&ast_fn.sig.inputs, args);
+
+        path_attribute.update_parameters(arguments);
+        path_attribute.update_parameters_parameter_in(into_params_types);
+    }
+
+    let path = Path::new(path_attribute, fn_name)
+        .path_operation(resolved_operation.map(|operation| operation.path_operation))
+        .path(|| resolved_path.map(|path| path.path))
+        .doc_comments(CommentAttributes::from_attributes(&ast_fn.attrs).0)
+        .deprecated(ast_fn.attrs.iter().find_map(|attr| {
+            if !matches!(attr.path.get_ident(), Some(ident) if &*ident.to_string() == "deprecated")
+            {
+                None
+            } else {
+                Some(true)
+            }
+        }));
+
+    quote! {
+        #path
+        #ast_fn
+    }
+    .into()
+}
+
+// #[proc_macro_error]
+// #[proc_macro_derive(OpenApi, attributes(openapi))]
+// /// Generate OpenApi base object with defaults from
+// /// project settings.
+// ///
+// /// This is `#[derive]` implementation for [`OpenApi`][openapi] trait. The macro accepts one `openapi` argument.
+// ///
+// /// # OpenApi `#[openapi(...)]` attributes
+// ///
+// /// * `paths(...)`  List of method references having attribute [`#[utoipa::path]`][path] macro.
+// /// * `components(schemas(...), responses(...))` Takes available _`component`_ configurations. Currently only
+// ///    _`schema`_ and _`response`_ components are supported.
+// ///    * `schemas(...)` List of [`ToSchema`][to_schema]s in OpenAPI schema.
+// ///    * `responses(...)` List of types that implement
+// /// [`ToResponse`][to_response_trait].
+// /// * `modifiers(...)` List of items implementing [`Modify`][modify] trait for runtime OpenApi modification.
+// ///   See the [trait documentation][modify] for more details.
+// /// * `security(...)` List of [`SecurityRequirement`][security]s global to all operations.
+// ///   See more details in [`#[utoipa::path(...)]`][path] [attribute macro security options][path_security].
+// /// * `tags(...)` List of [`Tag`][tags] which must match the tag _**path operation**_. By default
+// ///   the tag is derived from path given to **handlers** list or if undefined then `crate` is used by default.
+// ///   Alternatively the tag name can be given to path operation via [`#[utoipa::path(...)]`][path] macro.
+// ///   Tag can be used to define extra information for the api to produce richer documentation.
+// /// * `external_docs(...)` Can be used to reference external resource to the OpenAPI doc for extended documentation.
+// ///   External docs can be in [`OpenApi`][openapi_struct] or in [`Tag`][tags] level.
+// /// * `servers(...)` Define [`servers`][servers] as derive argumenst to the _`OpenApi`_. Servers
+// ///   are completely optional and thus can be omitted from the declaration.
+// /// * `info(...)` Declare [`Info`][info] attribute values used to override the default values
+// ///   generated from Cargo environment variables. **Note!** Defined attributes will override the
+// ///   whole attribute from generated values of Cargo environment variables. E.g. defining
+// ///   `contact(name = ...)` will ultimately override whole contact of info and not just partially
+// ///   the name.
+// ///
+// /// OpenApi derive macro will also derive [`Info`][info] for OpenApi specification using Cargo
+// /// environment variables.
+// ///
+// /// * env `CARGO_PKG_NAME` map to info `title`
+// /// * env `CARGO_PKG_VERSION` map to info `version`
+// /// * env `CARGO_PKG_DESCRIPTION` map info `description`
+// /// * env `CARGO_PKG_AUTHORS` map to contact `name` and `email` **only first author will be used**
+// /// * env `CARGO_PKG_LICENSE` map to info `license`
+// ///
+// /// # `info(...)` attribute syntax
+// /// * `title = ...` Define title of the API. It can be literal string.
+// /// * `description = ...` Define description of the API. Markdown can be used for rich text
+// ///   representation. It can be literal string or [`include_str!`] statement.
+// /// * `contanct(...)` Used to override the whole contanct generated from environment variables.
+// ///     * `name = ...` Define identifying name of contact person / organization. It Can be a literal string.
+// ///     * `email = ...` Define email address of the contact person / organization. It can be a literal string.
+// ///     * `url = ...` Define URL pointing to the contact information. It must be in URL formatted string.
+// /// * `license(...)` Used to override the whole license generated from environment variables.
+// ///     * `name = ...` License name of the API. It can be a literal string.
+// ///     * `url = ...` Define optional URL of the license. It must be URL formatted string.
+// ///
+// /// # `servers(...)` attribute syntax
+// /// * `url = ...` Define the url for server. It can be literal string.
+// /// * `description = ...` Define description for the server. It can be literal string.
+// /// * `variables(...)` Can be used to define variables for the url.
+// ///     * `name = ...` Is the first argument withing parentheses. It must be literal string.
+// ///     * `default = ...` Defines a default value for the variable if nothing else will be
+// ///       provided. If _`enum_values`_ is defined the _`default`_ must be found within the enum
+// ///       options. It can be a literal string.
+// ///     * `description = ...` Define the description for the variable. It can be a literal string.
+// ///     * `enum_values(...)` Define list of possible values for the variable. Values must be
+// ///       literal strings.
+// ///
+// ///  _**Example server variable definition.**_
+// ///  ```text
+// /// ("username" = (default = "demo", description = "Default username for API")),
+// /// ("port" = (enum_values("8080", "5000", "4545")))
+// /// ```
+// ///
+// /// # Examples
+// ///
+// /// _**Define OpenApi schema with some paths and components.**_
+// /// ```rust
+// /// # use utoipa::{OpenApi, ToSchema};
+// /// #
+// /// #[derive(ToSchema)]
+// /// struct Pet {
+// ///     name: String,
+// ///     age: i32,
+// /// }
+// ///
+// /// #[derive(ToSchema)]
+// /// enum Status {
+// ///     Active, InActive, Locked,
+// /// }
+// ///
+// /// #[utoipa::path(get, path = "/pet")]
+// /// fn get_pet() -> Pet {
+// ///     Pet {
+// ///         name: "bob".to_string(),
+// ///         age: 8,
+// ///     }
+// /// }
+// ///
+// /// #[utoipa::path(get, path = "/status")]
+// /// fn get_status() -> Status {
+// ///     Status::Active
+// /// }
+// ///
+// /// #[derive(OpenApi)]
+// /// #[openapi(
+// ///     paths(get_pet, get_status),
+// ///     components(schemas(Pet, Status)),
+// ///     security(
+// ///         (),
+// ///         ("my_auth" = ["read:items", "edit:items"]),
+// ///         ("token_jwt" = [])
+// ///     ),
+// ///     tags(
+// ///         (name = "pets::api", description = "All about pets",
+// ///             external_docs(url = "http://more.about.pets.api", description = "Find out more"))
+// ///     ),
+// ///     external_docs(url = "http://more.about.our.apis", description = "More about our APIs")
+// /// )]
+// /// struct ApiDoc;
+// /// ```
+// ///
+// /// _**Define servers to OpenApi.**_
+// ///```rust
+// /// # use utoipa::OpenApi;
+// /// #[derive(OpenApi)]
+// /// #[openapi(
+// ///     servers(
+// ///         (url = "http://localhost:8989", description = "Local server"),
+// ///         (url = "http://api.{username}:{port}", description = "Remote API",
+// ///             variables(
+// ///                 ("username" = (default = "demo", description = "Default username for API")),
+// ///                 ("port" = (default = "8080", enum_values("8080", "5000", "3030"), description = "Supported ports for API"))
+// ///             )
+// ///         )
+// ///     )
+// /// )]
+// /// struct ApiDoc;
+// ///```
+// ///
+// /// _**Define info attribute values used to override auto generated ones from Cargo environment
+// /// variables.**_
+// /// ```compile_fail
+// /// # use utoipa::OpenApi;
+// /// #[derive(OpenApi)]
+// /// #[openapi(info(
+// ///     title = "title override",
+// ///     description = include_str!("./path/to/content"), // fail compile cause no such file
+// ///     contact(name = "Test")
+// /// ))]
+// /// struct ApiDoc;
+// /// ```
+// ///
+// /// _**Create OpenAPI with resuable response.**_
+// /// ```rust
+// /// #[derive(utoipa::ToSchema)]
+// /// struct Person {
+// ///     name: String,
+// /// }
+// ///
+// /// /// Person list response
+// /// #[derive(utoipa::ToResponse)]
+// /// struct PersonList(Vec<Person>);
+// ///
+// /// #[utoipa::path(
+// ///     get,
+// ///     path = "/person-list",
+// ///     responses(
+// ///         (status = 200, response = PersonList)
+// ///     )
+// /// )]
+// /// fn get_persons() -> Vec<Person> {
+// ///     vec![]
+// /// }
+// ///
+// /// #[derive(utoipa::OpenApi)]
+// /// #[openapi(
+// ///     components(
+// ///         schemas(Person),
+// ///         responses(PersonList)
+// ///     )
+// /// )]
+// /// struct ApiDoc;
+// /// ```
+// ///
+// /// [openapi]: trait.OpenApi.html
+// /// [openapi_struct]: openapi/struct.OpenApi.html
+// /// [to_schema]: derive.ToSchema.html
+// /// [path]: attr.path.html
+// /// [modify]: trait.Modify.html
+// /// [info]: openapi/info/struct.Info.html
+// /// [security]: openapi/security/struct.SecurityRequirement.html
+// /// [path_security]: attr.path.html#security-requirement-attributes
+// /// [tags]: openapi/tag/struct.Tag.html
+// /// [to_response_trait]: trait.ToResponse.html
+// /// [servers]: openapi/server/index.html
+// pub fn openapi(input: TokenStream) -> TokenStream {
+//     let DeriveInput { attrs, ident, .. } = syn::parse_macro_input!(input);
+
+//     let openapi_attributes = openapi::parse_openapi_attrs(&attrs).expect_or_abort(
+//         "expected #[openapi(...)] attribute to be present when used with OpenApi derive trait",
+//     );
+
+//     let openapi = OpenApi(openapi_attributes, ident);
+
+//     openapi.to_token_stream().into()
+// }
+
+#[proc_macro_error]
 #[proc_macro_derive(OpenApi, attributes(openapi))]
-/// Generate OpenApi base object with defaults from
-/// project settings.
-///
-/// This is `#[derive]` implementation for [`OpenApi`][openapi] trait. The macro accepts one `openapi` argument.
-///
-/// # OpenApi `#[openapi(...)]` attributes
-///
-/// * `paths(...)`  List of method references having attribute [`#[utoipa::path]`][path] macro.
-/// * `components(schemas(...), responses(...))` Takes available _`component`_ configurations. Currently only
-///    _`schema`_ and _`response`_ components are supported.
-///    * `schemas(...)` List of [`ToSchema`][to_schema]s in OpenAPI schema.
-///    * `responses(...)` List of types that implement
-/// [`ToResponse`][to_response_trait].
-/// * `modifiers(...)` List of items implementing [`Modify`][modify] trait for runtime OpenApi modification.
-///   See the [trait documentation][modify] for more details.
-/// * `security(...)` List of [`SecurityRequirement`][security]s global to all operations.
-///   See more details in [`#[utoipa::path(...)]`][path] [attribute macro security options][path_security].
-/// * `tags(...)` List of [`Tag`][tags] which must match the tag _**path operation**_. By default
-///   the tag is derived from path given to **handlers** list or if undefined then `crate` is used by default.
-///   Alternatively the tag name can be given to path operation via [`#[utoipa::path(...)]`][path] macro.
-///   Tag can be used to define extra information for the api to produce richer documentation.
-/// * `external_docs(...)` Can be used to reference external resource to the OpenAPI doc for extended documentation.
-///   External docs can be in [`OpenApi`][openapi_struct] or in [`Tag`][tags] level.
-/// * `servers(...)` Define [`servers`][servers] as derive argumenst to the _`OpenApi`_. Servers
-///   are completely optional and thus can be omitted from the declaration.
-/// * `info(...)` Declare [`Info`][info] attribute values used to override the default values
-///   generated from Cargo environment variables. **Note!** Defined attributes will override the
-///   whole attribute from generated values of Cargo environment variables. E.g. defining
-///   `contact(name = ...)` will ultimately override whole contact of info and not just partially
-///   the name.
-///
-/// OpenApi derive macro will also derive [`Info`][info] for OpenApi specification using Cargo
-/// environment variables.
-///
-/// * env `CARGO_PKG_NAME` map to info `title`
-/// * env `CARGO_PKG_VERSION` map to info `version`
-/// * env `CARGO_PKG_DESCRIPTION` map info `description`
-/// * env `CARGO_PKG_AUTHORS` map to contact `name` and `email` **only first author will be used**
-/// * env `CARGO_PKG_LICENSE` map to info `license`
-///
-/// # `info(...)` attribute syntax
-/// * `title = ...` Define title of the API. It can be literal string.
-/// * `description = ...` Define description of the API. Markdown can be used for rich text
-///   representation. It can be literal string or [`include_str!`] statement.
-/// * `contanct(...)` Used to override the whole contanct generated from environment variables.
-///     * `name = ...` Define identifying name of contact person / organization. It Can be a literal string.
-///     * `email = ...` Define email address of the contact person / organization. It can be a literal string.
-///     * `url = ...` Define URL pointing to the contact information. It must be in URL formatted string.
-/// * `license(...)` Used to override the whole license generated from environment variables.
-///     * `name = ...` License name of the API. It can be a literal string.
-///     * `url = ...` Define optional URL of the license. It must be URL formatted string.
-///
-/// # `servers(...)` attribute syntax
-/// * `url = ...` Define the url for server. It can be literal string.
-/// * `description = ...` Define description for the server. It can be literal string.
-/// * `variables(...)` Can be used to define variables for the url.
-///     * `name = ...` Is the first argument withing parentheses. It must be literal string.
-///     * `default = ...` Defines a default value for the variable if nothing else will be
-///       provided. If _`enum_values`_ is defined the _`default`_ must be found within the enum
-///       options. It can be a literal string.
-///     * `description = ...` Define the description for the variable. It can be a literal string.
-///     * `enum_values(...)` Define list of possible values for the variable. Values must be
-///       literal strings.
-///
-///  _**Example server variable definition.**_
-///  ```text
-/// ("username" = (default = "demo", description = "Default username for API")),
-/// ("port" = (enum_values("8080", "5000", "4545")))
-/// ```
-///
-/// # Examples
-///
-/// _**Define OpenApi schema with some paths and components.**_
-/// ```rust
-/// # use utoipa::{OpenApi, ToSchema};
-/// #
-/// #[derive(ToSchema)]
-/// struct Pet {
-///     name: String,
-///     age: i32,
-/// }
-///
-/// #[derive(ToSchema)]
-/// enum Status {
-///     Active, InActive, Locked,
-/// }
-///
-/// #[utoipa::path(get, path = "/pet")]
-/// fn get_pet() -> Pet {
-///     Pet {
-///         name: "bob".to_string(),
-///         age: 8,
-///     }
-/// }
-///
-/// #[utoipa::path(get, path = "/status")]
-/// fn get_status() -> Status {
-///     Status::Active
-/// }
-///
-/// #[derive(OpenApi)]
-/// #[openapi(
-///     paths(get_pet, get_status),
-///     components(schemas(Pet, Status)),
-///     security(
-///         (),
-///         ("my_auth" = ["read:items", "edit:items"]),
-///         ("token_jwt" = [])
-///     ),
-///     tags(
-///         (name = "pets::api", description = "All about pets",
-///             external_docs(url = "http://more.about.pets.api", description = "Find out more"))
-///     ),
-///     external_docs(url = "http://more.about.our.apis", description = "More about our APIs")
-/// )]
-/// struct ApiDoc;
-/// ```
-///
-/// _**Define servers to OpenApi.**_
-///```rust
-/// # use utoipa::OpenApi;
-/// #[derive(OpenApi)]
-/// #[openapi(
-///     servers(
-///         (url = "http://localhost:8989", description = "Local server"),
-///         (url = "http://api.{username}:{port}", description = "Remote API",
-///             variables(
-///                 ("username" = (default = "demo", description = "Default username for API")),
-///                 ("port" = (default = "8080", enum_values("8080", "5000", "3030"), description = "Supported ports for API"))
-///             )
-///         )
-///     )
-/// )]
-/// struct ApiDoc;
-///```
-///
-/// _**Define info attribute values used to override auto generated ones from Cargo environment
-/// variables.**_
-/// ```compile_fail
-/// # use utoipa::OpenApi;
-/// #[derive(OpenApi)]
-/// #[openapi(info(
-///     title = "title override",
-///     description = include_str!("./path/to/content"), // fail compile cause no such file
-///     contact(name = "Test")
-/// ))]
-/// struct ApiDoc;
-/// ```
-///
-/// _**Create OpenAPI with resuable response.**_
-/// ```rust
-/// #[derive(utoipa::ToSchema)]
-/// struct Person {
-///     name: String,
-/// }
-///
-/// /// Person list response
-/// #[derive(utoipa::ToResponse)]
-/// struct PersonList(Vec<Person>);
-///
-/// #[utoipa::path(
-///     get,
-///     path = "/person-list",
-///     responses(
-///         (status = 200, response = PersonList)
-///     )
-/// )]
-/// fn get_persons() -> Vec<Person> {
-///     vec![]
-/// }
-///
-/// #[derive(utoipa::OpenApi)]
-/// #[openapi(
-///     components(
-///         schemas(Person),
-///         responses(PersonList)
-///     )
-/// )]
-/// struct ApiDoc;
-/// ```
-///
-/// [openapi]: trait.OpenApi.html
-/// [openapi_struct]: openapi/struct.OpenApi.html
-/// [to_schema]: derive.ToSchema.html
-/// [path]: attr.path.html
-/// [modify]: trait.Modify.html
-/// [info]: openapi/info/struct.Info.html
-/// [security]: openapi/security/struct.SecurityRequirement.html
-/// [path_security]: attr.path.html#security-requirement-attributes
-/// [tags]: openapi/tag/struct.Tag.html
-/// [to_response_trait]: trait.ToResponse.html
-/// [servers]: openapi/server/index.html
 pub fn openapi(input: TokenStream) -> TokenStream {
     let DeriveInput { attrs, ident, .. } = syn::parse_macro_input!(input);
 
-    let openapi_attributes = openapi::parse_openapi_attrs(&attrs).expect_or_abort(
+    let openapi_attributes = openapi::parse_fbr_openapi_attrs(&attrs).expect_or_abort(
         "expected #[openapi(...)] attribute to be present when used with OpenApi derive trait",
     );
 

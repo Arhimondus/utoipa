@@ -34,6 +34,135 @@ pub struct OpenApiAttr<'o> {
     servers: Punctuated<Server, Comma>,
 }
 
+#[derive(Default)]
+#[cfg_attr(feature = "debug", derive(Debug))]
+pub struct FbrOpenApiAttr<'o> {
+    info: Option<Info<'o>>,
+    components: Components,
+    modifiers: Punctuated<Modifier, Comma>,
+    security: Option<Array<'static, SecurityRequirementAttr>>,
+    tags: Option<Array<'static, Tag>>,
+    external_docs: Option<ExternalDocs>,
+    servers: Punctuated<Server, Comma>,
+}
+
+pub fn fbr_open_api_to_open_api(fbr_open_api_attr: FbrOpenApiAttr) -> OpenApiAttr {
+    let modules = actix_fbr_resolver::modules_path("src/routes");
+    let modules_joined = modules.join(",\n");
+    let parser = Punctuated::<ExprPath, Token![,]>::parse_terminated;
+    let modules_buffer: Punctuated<ExprPath, Comma> = syn::parse::Parser::parse_str(parser, &modules_joined).unwrap();
+    // let mdb: Punctuated<ExprPath, Comma> = modules_buffer.into();
+    // let pp = Punctuated::<ExprPath, Comma>::parse_terminated(&modules_buffer);
+
+    OpenApiAttr { 
+        info: fbr_open_api_attr.info, 
+        paths: modules_buffer,
+        components: fbr_open_api_attr.components, 
+        modifiers: fbr_open_api_attr.modifiers, 
+        security: fbr_open_api_attr.security, 
+        tags: fbr_open_api_attr.tags, 
+        external_docs: fbr_open_api_attr.external_docs, 
+        servers: fbr_open_api_attr.servers,
+    }
+}
+
+impl<'o> FbrOpenApiAttr<'o> {
+    fn merge(mut self, other: FbrOpenApiAttr<'o>) -> Self {
+        if other.info.is_some() {
+            self.info = other.info;
+        }
+        // if !other.paths.is_empty() {
+        //     self.paths = other.paths;
+        // }
+        if !other.components.schemas.is_empty() {
+            self.components.schemas = other.components.schemas;
+        }
+        if !other.components.responses.is_empty() {
+            self.components.responses = other.components.responses;
+        }
+        if other.security.is_some() {
+            self.security = other.security;
+        }
+        if other.tags.is_some() {
+            self.tags = other.tags;
+        }
+        if other.external_docs.is_some() {
+            self.external_docs = other.external_docs;
+        }
+        if !other.servers.is_empty() {
+            self.servers = other.servers;
+        }
+
+        self
+    }
+}
+
+pub fn parse_fbr_openapi_attrs(attrs: &[Attribute]) -> Option<OpenApiAttr> {
+    let fbr_openapi_attrs = attrs
+        .iter()
+        .filter(|attribute| attribute.path.is_ident("openapi"))
+        .map(|attribute| attribute.parse_args::<FbrOpenApiAttr>().unwrap_or_abort())
+        .reduce(|acc, item| acc.merge(item)).unwrap();
+    let openapi_attributes = fbr_open_api_to_open_api(fbr_openapi_attrs);
+    Some(openapi_attributes)
+}
+
+impl Parse for FbrOpenApiAttr<'_> {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        const EXPECTED_ATTRIBUTE: &str =
+            "unexpected attribute, expected any of: handlers, components, modifiers, security, tags, external_docs, servers";
+        let mut openapi = FbrOpenApiAttr::default();
+
+        while !input.is_empty() {
+            let ident = input.parse::<Ident>().map_err(|error| {
+                Error::new(error.span(), format!("{}, {}", EXPECTED_ATTRIBUTE, error))
+            })?;
+            let attribute = &*ident.to_string();
+
+            match attribute {
+                "info" => {
+                    let info_stream;
+                    parenthesized!(info_stream in input);
+                    openapi.info = Some(info_stream.parse()?)
+                }
+                "components" => {
+                    openapi.components = input.parse()?;
+                }
+                "modifiers" => {
+                    openapi.modifiers = parse_utils::parse_punctuated_within_parenthesis(input)?;
+                }
+                "security" => {
+                    let security;
+                    parenthesized!(security in input);
+                    openapi.security = Some(parse_utils::parse_groups(&security)?)
+                }
+                "tags" => {
+                    let tags;
+                    parenthesized!(tags in input);
+                    openapi.tags = Some(parse_utils::parse_groups(&tags)?);
+                }
+                "external_docs" => {
+                    let external_docs;
+                    parenthesized!(external_docs in input);
+                    openapi.external_docs = Some(external_docs.parse()?);
+                }
+                "servers" => {
+                    openapi.servers = parse_utils::parse_punctuated_within_parenthesis(input)?;
+                }
+                _ => {
+                    return Err(Error::new(ident.span(), EXPECTED_ATTRIBUTE));
+                }
+            }
+
+            if !input.is_empty() {
+                input.parse::<Token![,]>()?;
+            }
+        }
+
+        Ok(openapi)
+    }
+}
+
 impl<'o> OpenApiAttr<'o> {
     fn merge(mut self, other: OpenApiAttr<'o>) -> Self {
         if other.info.is_some() {
