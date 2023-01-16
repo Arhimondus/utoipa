@@ -20,7 +20,7 @@ proc-macro-error = "1.0"
 regex = { version = "1.5", optional = true }
 lazy_static = { version = "1.4", optional = true }
 uuid = { version = "1", optional = true }
-actix-fbr-resolver = { path = "../../actix-fbr-resolver" }
+actix-fbr-resolver = { path = "../actix-fbr-resolver" }
 
 [dev-dependencies]
 utoipa = { path = "../utoipa", default-features = false }
